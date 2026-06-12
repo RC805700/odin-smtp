@@ -1,15 +1,15 @@
 package smtp
 
+import openssl "./openssl"
+import "core:bufio"
 import "core:c"
 import "core:encoding/base64"
 import "core:fmt"
 import "core:io"
-import "core:bufio"
 import "core:net"
 import "core:strconv"
 import "core:strings"
 import "core:time"
-import openssl "../odin-http/openssl"
 
 EmailAddress :: struct {
 	name:  string,
@@ -31,7 +31,10 @@ Client :: struct {
 	_host: string,
 }
 
-Comm :: union {net.TCP_Socket, SSL_Comm}
+Comm :: union {
+	net.TCP_Socket,
+	SSL_Comm,
+}
 
 SSL_Comm :: struct {
 	ssl:    ^openssl.SSL,
@@ -67,7 +70,14 @@ Capabilities :: struct {
 DEFAULT_TIMEOUT :: 30 * time.Second
 DEFAULT_EHLO :: "localhost"
 
-connect_tls :: proc(host: string, port: int = 465, config: Client_Config = {}) -> (cl: Client, err: Error) {
+connect_tls :: proc(
+	host: string,
+	port: int = 465,
+	config: Client_Config = {},
+) -> (
+	cl: Client,
+	err: Error,
+) {
 	timeout := config.timeout if config.timeout != 0 else DEFAULT_TIMEOUT
 	ehlo := config.hello_hostname if config.hello_hostname != "" else DEFAULT_EHLO
 
@@ -116,7 +126,14 @@ connect_tls :: proc(host: string, port: int = 465, config: Client_Config = {}) -
 	return
 }
 
-connect_starttls :: proc(host: string, port: int = 587, config: Client_Config = {}) -> (cl: Client, err: Error) {
+connect_starttls :: proc(
+	host: string,
+	port: int = 587,
+	config: Client_Config = {},
+) -> (
+	cl: Client,
+	err: Error,
+) {
 	timeout := config.timeout if config.timeout != 0 else DEFAULT_TIMEOUT
 	ehlo := config.hello_hostname if config.hello_hostname != "" else DEFAULT_EHLO
 
@@ -224,7 +241,13 @@ auth_login :: proc(cl: ^Client, username, password: string) -> Error {
 	return nil
 }
 
-send_mail :: proc(cl: ^Client, from: EmailAddress, to: []EmailAddress, subject: string, opts: Send_Options) -> Error {
+send_mail :: proc(
+	cl: ^Client,
+	from: EmailAddress,
+	to: []EmailAddress,
+	subject: string,
+	opts: Send_Options,
+) -> Error {
 	from_cmd := fmt.aprintf("MAIL FROM:<%s>", from.email)
 	defer delete(from_cmd)
 	_write_line(cl, from_cmd) or_return
@@ -279,7 +302,16 @@ _tcp_stream :: proc(socket: net.TCP_Socket) -> io.Stream {
 	return s
 }
 
-_tcp_stream_proc :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+_tcp_stream_proc :: proc(
+	stream_data: rawptr,
+	mode: io.Stream_Mode,
+	p: []byte,
+	offset: i64,
+	whence: io.Seek_From,
+) -> (
+	n: i64,
+	err: io.Error,
+) {
 	socket := net.TCP_Socket(uintptr(stream_data))
 	#partial switch mode {
 	case .Read:
@@ -298,7 +330,16 @@ _ssl_stream :: proc(ssl: ^openssl.SSL) -> io.Stream {
 	return s
 }
 
-_ssl_stream_proc :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+_ssl_stream_proc :: proc(
+	stream_data: rawptr,
+	mode: io.Stream_Mode,
+	p: []byte,
+	offset: i64,
+	whence: io.Seek_From,
+) -> (
+	n: i64,
+	err: io.Error,
+) {
 	ssl := (^openssl.SSL)(stream_data)
 	#partial switch mode {
 	case .Read:
@@ -325,8 +366,11 @@ _make_reader :: proc(cl: ^Client) -> io.Stream {
 _write :: proc(cl: ^Client, data: []byte) -> Error {
 	switch s in cl._comm {
 	case net.TCP_Socket:
-		_, err := net.send_tcp(s, data)
-		return err
+		_, send_err := net.send_tcp(s, data)
+		if send_err != nil {
+			return send_err
+		}
+		return nil
 	case SSL_Comm:
 		remaining := data
 		for len(remaining) > 0 {
@@ -439,7 +483,9 @@ _ehlo :: proc(cl: ^Client) -> (caps: Capabilities, err: Error) {
 			caps.auth_login = true
 		}
 		if strings.has_prefix(upper, "250-SIZE") || strings.has_prefix(upper, "250 SIZE") {
-			size_str := strings.trim_space(strings.trim_prefix(strings.trim_prefix(upper, "250-SIZE"), "250 SIZE"))
+			size_str := strings.trim_space(
+				strings.trim_prefix(strings.trim_prefix(upper, "250-SIZE"), "250 SIZE"),
+			)
 			size, s_ok := strconv.parse_int(size_str, 10)
 			if s_ok {
 				caps.size = size
@@ -450,7 +496,13 @@ _ehlo :: proc(cl: ^Client) -> (caps: Capabilities, err: Error) {
 	return
 }
 
-_write_message :: proc(cl: ^Client, from: EmailAddress, to: []EmailAddress, subject: string, opts: Send_Options) -> Error {
+_write_message :: proc(
+	cl: ^Client,
+	from: EmailAddress,
+	to: []EmailAddress,
+	subject: string,
+	opts: Send_Options,
+) -> Error {
 	builder: strings.Builder
 
 	if from.name != "" {
@@ -520,3 +572,4 @@ _write_message :: proc(cl: ^Client, from: EmailAddress, to: []EmailAddress, subj
 
 	return nil
 }
+
