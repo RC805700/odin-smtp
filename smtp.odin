@@ -30,6 +30,7 @@ Client_Config :: struct {
 Client :: struct {
 	_comm: Comm,
 	_host: string,
+	_caps: Capabilities,
 }
 
 Comm :: union {
@@ -65,6 +66,7 @@ Capabilities :: struct {
 	auth_plain: bool,
 	auth_login: bool,
 	starttls:   bool,
+	_8bitmime:  bool,
 	size:       int,
 }
 
@@ -136,8 +138,10 @@ connect_tls :: proc(
 
 	_expect(&cl, 220) or_return
 
-	if _, ehlo_err := _ehlo(&cl); ehlo_err != nil {
+	if caps, ehlo_err := _ehlo(&cl); ehlo_err != nil {
 		_helo(&cl) or_return
+	} else {
+		cl._caps = caps
 	}
 
 	return
@@ -166,13 +170,14 @@ connect_starttls :: proc(
 
 	_expect(&cl, 220) or_return
 
-	caps, caps_err := _ehlo(&cl)
-	if caps_err != nil {
+	pre_caps, pre_err := _ehlo(&cl)
+	if pre_err != nil {
 		_helo(&cl) or_return
-		caps = {}
+		pre_caps = {}
 	}
+	cl._caps = pre_caps
 
-	if !caps.starttls {
+	if !pre_caps.starttls {
 		err = SMTP_Error{0, "STARTTLS not supported by server"}
 		return
 	}
@@ -209,8 +214,10 @@ connect_starttls :: proc(
 
 	cl._comm = SSL_Comm{ssl, ctx, socket}
 
-	if _, ehlo_err := _ehlo(&cl); ehlo_err != nil {
+	if post_caps, ehlo_err := _ehlo(&cl); ehlo_err != nil {
 		_helo(&cl) or_return
+	} else {
+		cl._caps = post_caps
 	}
 
 	return
@@ -272,7 +279,7 @@ send_mail :: proc(
 	subject: string,
 	opts: Send_Options,
 ) -> Error {
-	from_cmd := fmt.aprintf("MAIL FROM:<%s>", from.email)
+	from_cmd := fmt.aprintf("MAIL FROM:<%s>%s", from.email, " BODY=8BITMIME" if cl._caps._8bitmime else "")
 	defer delete(from_cmd)
 	_write_line(cl, from_cmd) or_return
 	_expect(cl, 250) or_return
@@ -511,6 +518,9 @@ _ehlo :: proc(cl: ^Client) -> (caps: Capabilities, err: Error) {
 		if strings.contains(upper, "STARTTLS") {
 			caps.starttls = true
 		}
+		if strings.contains(upper, "8BITMIME") {
+			caps._8bitmime = true
+		}
 		if strings.contains(upper, "AUTH PLAIN") {
 			caps.auth_plain = true
 		}
@@ -610,6 +620,57 @@ _format_rfc5322_date :: proc(t: time.Time) -> string {
 }
 
 @(private)
+_has_non_ascii :: proc(s: string) -> bool {
+	for b in s {
+		if b > 127 {return true}
+	}
+	return false
+}
+
+@(private)
+_encode_body_base64 :: proc(body: string) -> string {
+	b64 := base64.encode(transmute([]byte)body)
+	defer delete(b64)
+
+	buf := strings.builder_make()
+	defer strings.builder_destroy(&buf)
+
+	for i := 0; i < len(b64); i += 76 {
+		end := i + 76 if i + 76 <= len(b64) else len(b64)
+		strings.write_string(&buf, b64[i:end])
+		strings.write_string(&buf, "\r\n")
+	}
+
+	return strings.clone(strings.to_string(buf))
+}
+
+@(private)
+_write_body_part :: proc(cl: ^Client, content_type, body: string) -> Error {
+	cte: string
+	switch {
+	case cl._caps._8bitmime:
+		cte = "8bit"
+	case _has_non_ascii(body):
+		cte = "base64"
+	}
+
+	_write_stuffed_linef(cl, "Content-Type: %s; charset=\"UTF-8\"", content_type) or_return
+	if cte != "" {
+		_write_stuffed_linef(cl, "Content-Transfer-Encoding: %s", cte) or_return
+	}
+	_write_stuffed_line(cl, "") or_return
+
+	if cte == "base64" {
+		encoded := _encode_body_base64(body)
+		defer delete(encoded)
+		_write(cl, transmute([]byte)encoded) or_return
+	} else {
+		write_body_lines(cl, body) or_return
+	}
+	return nil
+}
+
+@(private)
 _write_message :: proc(
 	cl: ^Client,
 	from: EmailAddress,
@@ -672,26 +733,14 @@ _write_message :: proc(
 		) or_return
 		_write_stuffed_line(cl, "") or_return
 		_write_stuffed_linef(cl, "--%s", boundary) or_return
-		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
-		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
-		_write_stuffed_line(cl, "") or_return
-		write_body_lines(cl, opts.body_text) or_return
+		_write_body_part(cl, "text/plain", opts.body_text) or_return
 		_write_stuffed_linef(cl, "--%s", boundary) or_return
-		_write_stuffed_line(cl, "Content-Type: text/html; charset=\"UTF-8\"") or_return
-		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
-		_write_stuffed_line(cl, "") or_return
-		write_body_lines(cl, opts.body_html) or_return
+		_write_body_part(cl, "text/html", opts.body_html) or_return
 		_write_stuffed_linef(cl, "--%s--", boundary) or_return
 	} else if has_html {
-		_write_stuffed_line(cl, "Content-Type: text/html; charset=\"UTF-8\"") or_return
-		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
-		_write_stuffed_line(cl, "") or_return
-		write_body_lines(cl, opts.body_html) or_return
+		_write_body_part(cl, "text/html", opts.body_html) or_return
 	} else {
-		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
-		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
-		_write_stuffed_line(cl, "") or_return
-		write_body_lines(cl, opts.body_text) or_return
+		_write_body_part(cl, "text/plain", opts.body_text) or_return
 	}
 
 	return nil
