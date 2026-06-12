@@ -564,14 +564,47 @@ _write_message :: proc(
 	msg := strings.to_string(builder)
 	it := msg
 
+	in_headers := true
 	for line in strings.split_lines_iterator(&it) {
-		dot := "."
-		if len(line) > 0 && line[0] == '.' {
-			_write(cl, transmute([]byte)dot) or_return
+		if len(line) == 0 {
+			in_headers = false
 		}
-		_write_line(cl, line) or_return
+
+		if len(line) <= 998 {
+			_write_stuffed_line(cl, line) or_return
+			continue
+		}
+
+		remaining := line
+		first := true
+		for len(remaining) > 0 {
+			if first {
+				_write_stuffed_line(cl, remaining[:998]) or_return
+				remaining = remaining[998:]
+				first = false
+			} else if in_headers {
+				n := 997 if len(remaining) > 997 else len(remaining)
+				part := fmt.aprintf(" %s", remaining[:n])
+				_write_stuffed_line(cl, part) or_return
+				delete(part)
+				remaining = remaining[n:]
+			} else {
+				n := 998 if len(remaining) > 998 else len(remaining)
+				_write_stuffed_line(cl, remaining[:n]) or_return
+				remaining = remaining[n:]
+			}
+		}
 	}
 
+	return nil
+}
+
+_write_stuffed_line :: proc(cl: ^Client, line: string) -> Error {
+	dot := "."
+	if len(line) > 0 && line[0] == '.' {
+		_write(cl, transmute([]byte)dot) or_return
+	}
+	_write_line(cl, line) or_return
 	return nil
 }
 
