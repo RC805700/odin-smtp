@@ -24,6 +24,7 @@ Send_Options :: struct {
 Client_Config :: struct {
 	timeout:        time.Duration,
 	hello_hostname: string,
+	tls_insecure:   bool,
 }
 
 Client :: struct {
@@ -70,6 +71,15 @@ Capabilities :: struct {
 DEFAULT_TIMEOUT :: 30 * time.Second
 DEFAULT_EHLO :: "localhost"
 
+_apply_tls_config :: proc(ctx: ^openssl.SSL_CTX, config: Client_Config) -> Error {
+	if config.tls_insecure {return nil}
+	openssl.SSL_CTX_set_verify(ctx, openssl.SSL_VERIFY_PEER, nil)
+	if openssl.SSL_CTX_set_default_verify_paths(ctx) != 1 {
+		return SMTP_Error{0, "SSL_CTX_set_default_verify_paths failed"}
+	}
+	return nil
+}
+
 connect_tls :: proc(
 	host: string,
 	port: int = 465,
@@ -96,6 +106,7 @@ connect_tls :: proc(
 		err = SMTP_Error{0, "SSL_CTX_new failed"}
 		return
 	}
+	_apply_tls_config(ctx, config) or_return
 	ssl := openssl.SSL_new(ctx)
 	if ssl == nil {
 		openssl.SSL_CTX_free(ctx)
@@ -164,6 +175,7 @@ connect_starttls :: proc(
 		err = SMTP_Error{0, "SSL_CTX_new failed"}
 		return
 	}
+	_apply_tls_config(ctx, config) or_return
 	ssl := openssl.SSL_new(ctx)
 	if ssl == nil {
 		openssl.SSL_CTX_free(ctx)
@@ -497,6 +509,27 @@ _ehlo :: proc(cl: ^Client) -> (caps: Capabilities, err: Error) {
 	return
 }
 
+_encode_2047_subject :: proc(subject: string) -> string {
+	for b in subject {
+		if b > 127 {
+			encoded := base64.encode(transmute([]byte)subject)
+			defer delete(encoded)
+			return fmt.aprintf("=?UTF-8?B?%s?=", encoded)
+		}
+	}
+	return strings.clone(subject)
+}
+
+_format_rfc5322_date :: proc(t: time.Time) -> string {
+	wkday_strs := [?]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	month_strs := [?]string{"???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+	wkday := time.weekday(t)
+	year, month, day := time.date(t)
+	hour, min, sec := time.clock(t)
+	return fmt.aprintf("%s, %02d %s %04d %02d:%02d:%02d +0000",
+		wkday_strs[wkday], day, month_strs[month], year, hour, min, sec)
+}
+
 _write_message :: proc(
 	cl: ^Client,
 	from: EmailAddress,
@@ -524,8 +557,13 @@ _write_message :: proc(
 	defer delete(to_header)
 	_write_header_linef(cl, "To: %s", to_header) or_return
 
-	// Subject
-	_write_header_linef(cl, "Subject: %s", subject) or_return
+	// Subject (RFC 2047 auto-encode if non-ASCII)
+	encoded_subject := _encode_2047_subject(subject)
+	defer delete(encoded_subject)
+	_write_header_linef(cl, "Subject: %s", encoded_subject) or_return
+
+	// Date (RFC 5322 §3.6.1 - MUST)
+	_write_header_linef(cl, "Date: %s", _format_rfc5322_date(time.now())) or_return
 
 	// MIME-Version
 	_write_stuffed_line(cl, "MIME-Version: 1.0") or_return
@@ -542,19 +580,23 @@ _write_message :: proc(
 		_write_stuffed_line(cl, "") or_return
 		_write_stuffed_linef(cl, "--%s", boundary) or_return
 		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
 		_write_stuffed_line(cl, "") or_return
 		write_body_lines(cl, opts.body_text) or_return
 		_write_stuffed_linef(cl, "--%s", boundary) or_return
 		_write_stuffed_line(cl, "Content-Type: text/html; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
 		_write_stuffed_line(cl, "") or_return
 		write_body_lines(cl, opts.body_html) or_return
 		_write_stuffed_linef(cl, "--%s--", boundary) or_return
 	} else if has_html {
 		_write_stuffed_line(cl, "Content-Type: text/html; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
 		_write_stuffed_line(cl, "") or_return
 		write_body_lines(cl, opts.body_html) or_return
 	} else {
 		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "Content-Transfer-Encoding: 8bit") or_return
 		_write_stuffed_line(cl, "") or_return
 		write_body_lines(cl, opts.body_text) or_return
 	}

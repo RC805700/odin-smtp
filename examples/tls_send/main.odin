@@ -21,6 +21,7 @@ main :: proc() {
 		fmt.eprintln("  --subject=<subj>    Email subject")
 		fmt.eprintln("  --body-text=<text>  Plain text body")
 		fmt.eprintln("  --body-html=<html>  HTML body")
+		fmt.eprintln("  --insecure          Skip TLS certificate verification")
 		os.exit(1)
 	}
 
@@ -32,7 +33,7 @@ main :: proc() {
 	}
 
 	fmt.printfln("Connecting to %s:%d (TLS)...", cfg.host, cfg.port)
-	cl, err := smtp.connect_tls(cfg.host, cfg.port)
+	cl, err := smtp.connect_tls(cfg.host, cfg.port, {tls_insecure = cfg.insecure})
 	if err != nil {
 		fmt.eprintfln("Connection failed: %v", err)
 		os.exit(1)
@@ -78,6 +79,7 @@ Config :: struct {
 	subject:    string,
 	body_text:  string,
 	body_html:  string,
+	insecure:   bool,
 }
 
 parse_args :: proc(args: []string) -> Config {
@@ -124,6 +126,8 @@ parse_args :: proc(args: []string) -> Config {
 			cfg.body_text = val
 		case "--body-html":
 			cfg.body_html = val
+		case "--insecure":
+			cfg.insecure = true
 		case "--help":
 		case:
 			fmt.eprintfln("Warning: unknown flag %s", key)
