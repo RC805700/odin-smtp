@@ -278,7 +278,8 @@ close :: proc(cl: ^Client) {
 
 _close :: proc(cl: ^Client) {
 	_write_line(cl, "QUIT")
-	_read_response(cl)
+	resp, _ := _read_response(cl)
+	defer _response_destroy(&resp)
 
 	switch s in cl._comm {
 	case net.TCP_Socket:
@@ -504,6 +505,7 @@ _write_message :: proc(
 	opts: Send_Options,
 ) -> Error {
 	builder: strings.Builder
+	defer strings.builder_destroy(&builder)
 
 	if from.name != "" {
 		fmt.sbprintf(&builder, "From: %s <%s>\n", from.name, from.email)

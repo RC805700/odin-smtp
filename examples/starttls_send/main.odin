@@ -1,8 +1,8 @@
 package main
 
+import smtp "../.."
 import "core:fmt"
 import "core:os"
-import smtp "../.."
 
 main :: proc() {
 	args := os.args[1:]
@@ -47,9 +47,15 @@ main :: proc() {
 		}
 	}
 
-	from := smtp.EmailAddress{name = cfg.from_name, email = cfg.from_email}
-	to   := []smtp.EmailAddress{{name = cfg.to_name, email = cfg.to_email}}
-	opts := smtp.Send_Options{body_text = cfg.body_text, body_html = cfg.body_html}
+	from := smtp.EmailAddress {
+		name  = cfg.from_name,
+		email = cfg.from_email,
+	}
+	to := []smtp.EmailAddress{{name = cfg.to_name, email = cfg.to_email}}
+	opts := smtp.Send_Options {
+		body_text = cfg.body_text,
+		body_html = cfg.body_html,
+	}
 
 	fmt.printfln("Sending email to %s...", cfg.to_email)
 	if send_err := smtp.send_mail(&cl, from, to, cfg.subject, opts); send_err != nil {
@@ -61,23 +67,23 @@ main :: proc() {
 }
 
 Config :: struct {
-	host:      string,
-	port:      int,
-	user:      string,
-	pass:      string,
+	host:       string,
+	port:       int,
+	user:       string,
+	pass:       string,
 	from_email: string,
 	from_name:  string,
 	to_email:   string,
 	to_name:    string,
-	subject:   string,
-	body_text: string,
-	body_html: string,
+	subject:    string,
+	body_text:  string,
+	body_html:  string,
 }
 
 parse_args :: proc(args: []string) -> Config {
 	cfg := Config {
-		port    = 587,
-		subject = "Test from odin-smtp",
+		port      = 587,
+		subject   = "Test from odin-smtp",
 		body_text = "This is a test email sent with odin-smtp via STARTTLS.",
 		body_html = "<p>This is a test email sent with <b>odin-smtp</b> via STARTTLS.</p>",
 	}
@@ -94,19 +100,30 @@ parse_args :: proc(args: []string) -> Config {
 			continue
 		}
 		key := arg[:eq]
-		val := arg[eq+1:]
+		val := arg[eq + 1:]
 		switch key {
-		case "--host":      cfg.host = val
-		case "--port":      cfg.port = _parse_port(val, 587)
-		case "--user":      cfg.user = val
-		case "--pass":      cfg.pass = val
-		case "--from-email": cfg.from_email = val
-		case "--from-name":  cfg.from_name = val
-		case "--to":         cfg.to_email = val
-		case "--to-name":    cfg.to_name = val
-		case "--subject":   cfg.subject = val
-		case "--body-text": cfg.body_text = val
-		case "--body-html": cfg.body_html = val
+		case "--host":
+			cfg.host = val
+		case "--port":
+			cfg.port = _parse_port(val, 587)
+		case "--user":
+			cfg.user = val
+		case "--pass":
+			cfg.pass = val
+		case "--from-email":
+			cfg.from_email = val
+		case "--from-name":
+			cfg.from_name = val
+		case "--to":
+			cfg.to_email = val
+		case "--to-name":
+			cfg.to_name = val
+		case "--subject":
+			cfg.subject = val
+		case "--body-text":
+			cfg.body_text = val
+		case "--body-html":
+			cfg.body_html = val
 		case "--help":
 		case:
 			fmt.eprintfln("Warning: unknown flag %s", key)
@@ -127,3 +144,4 @@ _parse_port :: proc(s: string, default: int) -> int {
 	}
 	return n
 }
+
