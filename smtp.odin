@@ -504,15 +504,10 @@ _write_message :: proc(
 	subject: string,
 	opts: Send_Options,
 ) -> Error {
-	builder: strings.Builder
-	defer strings.builder_destroy(&builder)
+	// From header
+	_write_header_linef(cl, "From: %s <%s>" if from.name != "" else "From: <%s>", from.name, from.email) or_return
 
-	if from.name != "" {
-		fmt.sbprintf(&builder, "From: %s <%s>\n", from.name, from.email)
-	} else {
-		fmt.sbprintf(&builder, "From: <%s>\n", from.email)
-	}
-
+	// To header
 	to_addrs := make([dynamic]string, 0, len(to))
 	defer {
 		for a in to_addrs {delete(a)}
@@ -527,10 +522,13 @@ _write_message :: proc(
 	}
 	to_header := strings.join(to_addrs[:], ", ")
 	defer delete(to_header)
-	fmt.sbprintf(&builder, "To: %s\n", to_header)
+	_write_header_linef(cl, "To: %s", to_header) or_return
 
-	fmt.sbprintf(&builder, "Subject: %s\n", subject)
-	fmt.sbprintf(&builder, "MIME-Version: 1.0\n")
+	// Subject
+	_write_header_linef(cl, "Subject: %s", subject) or_return
+
+	// MIME-Version
+	_write_stuffed_line(cl, "MIME-Version: 1.0") or_return
 
 	ns := time.to_unix_nanoseconds(time.now())
 	boundary := fmt.aprintf("=_OdSMTP_%d", ns)
@@ -540,62 +538,72 @@ _write_message :: proc(
 	has_html := opts.body_html != ""
 
 	if has_text && has_html {
-		fmt.sbprintf(&builder, "Content-Type: multipart/alternative; boundary=\"%s\"\n", boundary)
-		fmt.sbprintf(&builder, "\n")
-		fmt.sbprintf(&builder, "--%s\n", boundary)
-		fmt.sbprintf(&builder, "Content-Type: text/plain; charset=\"UTF-8\"\n")
-		fmt.sbprintf(&builder, "\n")
-		fmt.sbprintf(&builder, "%s\n", opts.body_text)
-		fmt.sbprintf(&builder, "--%s\n", boundary)
-		fmt.sbprintf(&builder, "Content-Type: text/html; charset=\"UTF-8\"\n")
-		fmt.sbprintf(&builder, "\n")
-		fmt.sbprintf(&builder, "%s\n", opts.body_html)
-		fmt.sbprintf(&builder, "--%s--\n", boundary)
+		_write_header_linef(cl, "Content-Type: multipart/alternative; boundary=\"%s\"", boundary) or_return
+		_write_stuffed_line(cl, "") or_return
+		_write_stuffed_linef(cl, "--%s", boundary) or_return
+		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "") or_return
+		write_body_lines(cl, opts.body_text) or_return
+		_write_stuffed_linef(cl, "--%s", boundary) or_return
+		_write_stuffed_line(cl, "Content-Type: text/html; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "") or_return
+		write_body_lines(cl, opts.body_html) or_return
+		_write_stuffed_linef(cl, "--%s--", boundary) or_return
 	} else if has_html {
-		fmt.sbprintf(&builder, "Content-Type: text/html; charset=\"UTF-8\"\n")
-		fmt.sbprintf(&builder, "\n")
-		fmt.sbprintf(&builder, "%s\n", opts.body_html)
+		_write_stuffed_line(cl, "Content-Type: text/html; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "") or_return
+		write_body_lines(cl, opts.body_html) or_return
 	} else {
-		fmt.sbprintf(&builder, "Content-Type: text/plain; charset=\"UTF-8\"\n")
-		fmt.sbprintf(&builder, "\n")
-		fmt.sbprintf(&builder, "%s\n", opts.body_text)
+		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
+		_write_stuffed_line(cl, "") or_return
+		write_body_lines(cl, opts.body_text) or_return
 	}
 
-	msg := strings.to_string(builder)
-	it := msg
+	return nil
+}
 
-	in_headers := true
+_write_header_line :: proc(cl: ^Client, line: string) -> Error {
+	if len(line) <= 998 {
+		return _write_stuffed_line(cl, line)
+	}
+	_write_stuffed_line(cl, line[:998]) or_return
+	remaining := line[998:]
+	for len(remaining) > 0 {
+		n := 997 if len(remaining) > 997 else len(remaining)
+		part := fmt.aprintf(" %s", remaining[:n])
+		_write_stuffed_line(cl, part) or_return
+		delete(part)
+		remaining = remaining[n:]
+	}
+	return nil
+}
+
+_write_header_linef :: proc(cl: ^Client, fmt_str: string, args: ..any) -> Error {
+	line := fmt.aprintf(fmt_str, ..args)
+	defer delete(line)
+	return _write_header_line(cl, line)
+}
+
+_write_stuffed_linef :: proc(cl: ^Client, fmt_str: string, args: ..any) -> Error {
+	line := fmt.aprintf(fmt_str, ..args)
+	defer delete(line)
+	return _write_stuffed_line(cl, line)
+}
+
+write_body_lines :: proc(cl: ^Client, body: string) -> Error {
+	it := body
 	for line in strings.split_lines_iterator(&it) {
-		if len(line) == 0 {
-			in_headers = false
-		}
-
 		if len(line) <= 998 {
 			_write_stuffed_line(cl, line) or_return
 			continue
 		}
-
 		remaining := line
-		first := true
 		for len(remaining) > 0 {
-			if first {
-				_write_stuffed_line(cl, remaining[:998]) or_return
-				remaining = remaining[998:]
-				first = false
-			} else if in_headers {
-				n := 997 if len(remaining) > 997 else len(remaining)
-				part := fmt.aprintf(" %s", remaining[:n])
-				_write_stuffed_line(cl, part) or_return
-				delete(part)
-				remaining = remaining[n:]
-			} else {
-				n := 998 if len(remaining) > 998 else len(remaining)
-				_write_stuffed_line(cl, remaining[:n]) or_return
-				remaining = remaining[n:]
-			}
+			n := 998 if len(remaining) > 998 else len(remaining)
+			_write_stuffed_line(cl, remaining[:n]) or_return
+			remaining = remaining[n:]
 		}
 	}
-
 	return nil
 }
 
