@@ -68,9 +68,13 @@ Capabilities :: struct {
 	size:       int,
 }
 
+@(private)
+_message_id_counter: u64
+
 DEFAULT_TIMEOUT :: 30 * time.Second
 DEFAULT_EHLO :: "localhost"
 
+@(private)
 _apply_tls_config :: proc(ctx: ^openssl.SSL_CTX, config: Client_Config) -> Error {
 	if config.tls_insecure {return nil}
 	openssl.SSL_CTX_set_verify(ctx, openssl.SSL_VERIFY_PEER, nil)
@@ -132,7 +136,9 @@ connect_tls :: proc(
 
 	_expect(&cl, 220) or_return
 
-	_ehlo(&cl) or_return
+	if _, ehlo_err := _ehlo(&cl); ehlo_err != nil {
+		_helo(&cl) or_return
+	}
 
 	return
 }
@@ -160,7 +166,11 @@ connect_starttls :: proc(
 
 	_expect(&cl, 220) or_return
 
-	caps := _ehlo(&cl) or_return
+	caps, caps_err := _ehlo(&cl)
+	if caps_err != nil {
+		_helo(&cl) or_return
+		caps = {}
+	}
 
 	if !caps.starttls {
 		err = SMTP_Error{0, "STARTTLS not supported by server"}
@@ -199,7 +209,9 @@ connect_starttls :: proc(
 
 	cl._comm = SSL_Comm{ssl, ctx, socket}
 
-	_ehlo(&cl) or_return
+	if _, ehlo_err := _ehlo(&cl); ehlo_err != nil {
+		_helo(&cl) or_return
+	}
 
 	return
 }
@@ -288,6 +300,7 @@ close :: proc(cl: ^Client) {
 	_close(cl)
 }
 
+@(private)
 _close :: proc(cl: ^Client) {
 	_write_line(cl, "QUIT")
 	resp, _ := _read_response(cl)
@@ -306,8 +319,8 @@ _close :: proc(cl: ^Client) {
 	cl^ = {}
 }
 
-// --- internal stream helpers (same pattern as odin-http client) ---
-
+// --- internal stream helpers  ---
+@(private)
 _tcp_stream :: proc(socket: net.TCP_Socket) -> io.Stream {
 	s: io.Stream
 	s.procedure = io.Stream_Proc(_tcp_stream_proc)
@@ -315,6 +328,7 @@ _tcp_stream :: proc(socket: net.TCP_Socket) -> io.Stream {
 	return s
 }
 
+@(private)
 _tcp_stream_proc :: proc(
 	stream_data: rawptr,
 	mode: io.Stream_Mode,
@@ -330,12 +344,13 @@ _tcp_stream_proc :: proc(
 	case .Read:
 		if len(p) == 0 {return 0, nil}
 		n_read, r_err := net.recv_tcp(socket, p)
-		if r_err != nil {return -1, nil}
+		if r_err != nil {return 0, .EOF}
 		return i64(n_read), nil
 	}
 	return -1, nil
 }
 
+@(private)
 _ssl_stream :: proc(ssl: ^openssl.SSL) -> io.Stream {
 	s: io.Stream
 	s.procedure = io.Stream_Proc(_ssl_stream_proc)
@@ -343,6 +358,7 @@ _ssl_stream :: proc(ssl: ^openssl.SSL) -> io.Stream {
 	return s
 }
 
+@(private)
 _ssl_stream_proc :: proc(
 	stream_data: rawptr,
 	mode: io.Stream_Mode,
@@ -358,12 +374,13 @@ _ssl_stream_proc :: proc(
 	case .Read:
 		if len(p) == 0 {return 0, nil}
 		ret := openssl.SSL_read(ssl, raw_data(p), c.int(len(p)))
-		if ret <= 0 {return -1, nil}
+		if ret <= 0 {return 0, .EOF}
 		return i64(ret), nil
 	}
 	return -1, nil
 }
 
+@(private)
 _make_reader :: proc(cl: ^Client) -> io.Stream {
 	switch s in cl._comm {
 	case net.TCP_Socket:
@@ -375,7 +392,7 @@ _make_reader :: proc(cl: ^Client) -> io.Stream {
 }
 
 // --- I/O helpers ---
-
+@(private)
 _write :: proc(cl: ^Client, data: []byte) -> Error {
 	switch s in cl._comm {
 	case net.TCP_Socket:
@@ -398,6 +415,7 @@ _write :: proc(cl: ^Client, data: []byte) -> Error {
 	return nil
 }
 
+@(private)
 _write_line :: proc(cl: ^Client, line: string) -> Error {
 	_write(cl, transmute([]byte)line) or_return
 	crlf := "\r\n"
@@ -405,6 +423,7 @@ _write_line :: proc(cl: ^Client, line: string) -> Error {
 	return nil
 }
 
+@(private)
 _read_response :: proc(cl: ^Client) -> (res: Response, err: Error) {
 	stream := _make_reader(cl)
 	scanner: bufio.Scanner
@@ -447,6 +466,7 @@ _read_response :: proc(cl: ^Client) -> (res: Response, err: Error) {
 	return
 }
 
+@(private)
 _response_destroy :: proc(res: ^Response) {
 	for line in res.lines {
 		delete(line)
@@ -454,6 +474,7 @@ _response_destroy :: proc(res: ^Response) {
 	delete(res.lines)
 }
 
+@(private)
 _expect :: proc(cl: ^Client, expected: int) -> Error {
 	resp := _read_response(cl) or_return
 	defer _response_destroy(&resp)
@@ -468,6 +489,7 @@ _expect :: proc(cl: ^Client, expected: int) -> Error {
 	return nil
 }
 
+@(private)
 _ehlo :: proc(cl: ^Client) -> (caps: Capabilities, err: Error) {
 	cmd := fmt.aprintf("EHLO %s", cl._host)
 	defer delete(cmd)
@@ -509,6 +531,40 @@ _ehlo :: proc(cl: ^Client) -> (caps: Capabilities, err: Error) {
 	return
 }
 
+@(private)
+_helo :: proc(cl: ^Client) -> Error {
+	cmd := fmt.aprintf("HELO %s", cl._host)
+	defer delete(cmd)
+	_write_line(cl, cmd) or_return
+	return _expect(cl, 250)
+}
+
+@(private)
+_generate_message_id :: proc(hostname: string) -> string {
+	_message_id_counter += 1
+	return fmt.aprintf(
+		"<%d.%d@%s>",
+		time.to_unix_nanoseconds(time.now()),
+		_message_id_counter,
+		hostname,
+	)
+}
+
+@(private)
+_make_boundary :: proc(text, html: string) -> string {
+	_message_id_counter += 1
+	base_ns := time.to_unix_nanoseconds(time.now())
+	candidate := fmt.aprintf("=_OdSMTP_%d_%x", base_ns, _message_id_counter)
+	for strings.contains(text, candidate) || strings.contains(html, candidate) {
+		delete(candidate)
+		_message_id_counter += 1
+		if _message_id_counter > 1_000_000 {break}
+		candidate = fmt.aprintf("=_OdSMTP_%d_%x", base_ns, _message_id_counter)
+	}
+	return candidate
+}
+
+@(private)
 _encode_2047_subject :: proc(subject: string) -> string {
 	for b in subject {
 		if b > 127 {
@@ -520,16 +576,40 @@ _encode_2047_subject :: proc(subject: string) -> string {
 	return strings.clone(subject)
 }
 
+@(private)
 _format_rfc5322_date :: proc(t: time.Time) -> string {
 	wkday_strs := [?]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
-	month_strs := [?]string{"???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+	month_strs := [?]string {
+		"???",
+		"Jan",
+		"Feb",
+		"Mar",
+		"Apr",
+		"May",
+		"Jun",
+		"Jul",
+		"Aug",
+		"Sep",
+		"Oct",
+		"Nov",
+		"Dec",
+	}
 	wkday := time.weekday(t)
 	year, month, day := time.date(t)
 	hour, min, sec := time.clock(t)
-	return fmt.aprintf("%s, %02d %s %04d %02d:%02d:%02d +0000",
-		wkday_strs[wkday], day, month_strs[month], year, hour, min, sec)
+	return fmt.aprintf(
+		"%s, %02d %s %04d %02d:%02d:%02d +0000",
+		wkday_strs[wkday],
+		day,
+		month_strs[month],
+		year,
+		hour,
+		min,
+		sec,
+	)
 }
 
+@(private)
 _write_message :: proc(
 	cl: ^Client,
 	from: EmailAddress,
@@ -538,7 +618,12 @@ _write_message :: proc(
 	opts: Send_Options,
 ) -> Error {
 	// From header
-	_write_header_linef(cl, "From: %s <%s>" if from.name != "" else "From: <%s>", from.name, from.email) or_return
+	_write_header_linef(
+		cl,
+		"From: %s <%s>" if from.name != "" else "From: <%s>",
+		from.name,
+		from.email,
+	) or_return
 
 	// To header
 	to_addrs := make([dynamic]string, 0, len(to))
@@ -565,18 +650,26 @@ _write_message :: proc(
 	// Date (RFC 5322 §3.6.1 - MUST)
 	_write_header_linef(cl, "Date: %s", _format_rfc5322_date(time.now())) or_return
 
+	// Message-ID (RFC 5322 §3.6.4 - SHOULD)
+	msg_id := _generate_message_id(cl._host)
+	defer delete(msg_id)
+	_write_header_linef(cl, "Message-ID: %s", msg_id) or_return
+
 	// MIME-Version
 	_write_stuffed_line(cl, "MIME-Version: 1.0") or_return
 
-	ns := time.to_unix_nanoseconds(time.now())
-	boundary := fmt.aprintf("=_OdSMTP_%d", ns)
+	boundary := _make_boundary(opts.body_text, opts.body_html)
 	defer delete(boundary)
 
 	has_text := opts.body_text != ""
 	has_html := opts.body_html != ""
 
 	if has_text && has_html {
-		_write_header_linef(cl, "Content-Type: multipart/alternative; boundary=\"%s\"", boundary) or_return
+		_write_header_linef(
+			cl,
+			"Content-Type: multipart/alternative; boundary=\"%s\"",
+			boundary,
+		) or_return
 		_write_stuffed_line(cl, "") or_return
 		_write_stuffed_linef(cl, "--%s", boundary) or_return
 		_write_stuffed_line(cl, "Content-Type: text/plain; charset=\"UTF-8\"") or_return
@@ -604,6 +697,7 @@ _write_message :: proc(
 	return nil
 }
 
+@(private)
 _write_header_line :: proc(cl: ^Client, line: string) -> Error {
 	if len(line) <= 998 {
 		return _write_stuffed_line(cl, line)
@@ -620,12 +714,14 @@ _write_header_line :: proc(cl: ^Client, line: string) -> Error {
 	return nil
 }
 
+@(private)
 _write_header_linef :: proc(cl: ^Client, fmt_str: string, args: ..any) -> Error {
 	line := fmt.aprintf(fmt_str, ..args)
 	defer delete(line)
 	return _write_header_line(cl, line)
 }
 
+@(private)
 _write_stuffed_linef :: proc(cl: ^Client, fmt_str: string, args: ..any) -> Error {
 	line := fmt.aprintf(fmt_str, ..args)
 	defer delete(line)
@@ -649,6 +745,7 @@ write_body_lines :: proc(cl: ^Client, body: string) -> Error {
 	return nil
 }
 
+@(private)
 _write_stuffed_line :: proc(cl: ^Client, line: string) -> Error {
 	dot := "."
 	if len(line) > 0 && line[0] == '.' {
