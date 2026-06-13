@@ -3,6 +3,7 @@ package main
 import smtp "../.."
 import "core:fmt"
 import "core:os"
+import "core:strings"
 
 main :: proc() {
 	args := os.args[1:]
@@ -21,6 +22,9 @@ main :: proc() {
 		fmt.eprintln("  --subject=<subj>    Email subject")
 		fmt.eprintln("  --body-text=<text>  Plain text body")
 		fmt.eprintln("  --body-html=<html>  HTML body")
+		fmt.eprintln("  --attach=<path>     File to attach as attachment")
+		fmt.eprintln("  --inline=<path>     File to embed as inline image")
+		fmt.eprintln("  --cid=<name>        Content-ID for the inline image")
 		fmt.eprintln("  --insecure          Skip TLS certificate verification")
 		os.exit(1)
 	}
@@ -54,8 +58,16 @@ main :: proc() {
 	}
 	to := []smtp.EmailAddress{{name = cfg.to_name, email = cfg.to_email}}
 	opts := smtp.Send_Options {
-		body_text = cfg.body_text,
-		body_html = cfg.body_html,
+		body_text   = cfg.body_text,
+		body_html   = cfg.body_html,
+		attachments = _load_attachments(cfg),
+	}
+	defer {
+		for a in opts.attachments {
+			delete(a.content)
+			delete(a.filename)
+		}
+		delete(opts.attachments)
 	}
 
 	fmt.printfln("Sending email to %s...", cfg.to_email)
@@ -67,19 +79,71 @@ main :: proc() {
 	fmt.println("Email sent successfully!")
 }
 
+_load_attachments :: proc(cfg: Config) -> []smtp.Attachment {
+	atts := make([dynamic]smtp.Attachment, 0)
+
+	if cfg.attach_path != "" {
+		data, data_err := os.read_entire_file_from_path(cfg.attach_path, context.allocator)
+		if data_err != nil {
+			fmt.eprintfln("Warning: could not read attachment %q: %v", cfg.attach_path, data_err)
+		} else {
+			name := basename(cfg.attach_path)
+			append(
+				&atts,
+				smtp.Attachment {
+					filename = strings.clone(name),
+					content = data,
+					disposition = .Attachment,
+				},
+			)
+		}
+	}
+
+	if cfg.inline_path != "" {
+		data, data_err := os.read_entire_file_from_path(cfg.inline_path, context.allocator)
+		if data_err != nil {
+			fmt.eprintfln("Warning: could not read inline %q: %v", cfg.inline_path, data_err)
+		} else {
+			append(
+				&atts,
+				smtp.Attachment {
+					filename = strings.clone(basename(cfg.inline_path)),
+					content = data,
+					disposition = .Inline,
+					content_id = cfg.inline_cid,
+				},
+			)
+		}
+	}
+
+	return atts[:]
+}
+
+basename :: proc(path: string) -> string {
+	for i := len(path) - 1; i >= 0; i -= 1 {
+		if path[i] == '/' || path[i] == '\\' {
+			return path[i + 1:]
+		}
+	}
+	return path
+}
+
 Config :: struct {
-	host:       string,
-	port:       int,
-	user:       string,
-	pass:       string,
-	from_email: string,
-	from_name:  string,
-	to_email:   string,
-	to_name:    string,
-	subject:    string,
-	body_text:  string,
-	body_html:  string,
-	insecure:   bool,
+	host:        string,
+	port:        int,
+	user:        string,
+	pass:        string,
+	from_email:  string,
+	from_name:   string,
+	to_email:    string,
+	to_name:     string,
+	subject:     string,
+	body_text:   string,
+	body_html:   string,
+	attach_path: string,
+	inline_path: string,
+	inline_cid:  string,
+	insecure:    bool,
 }
 
 parse_args :: proc(args: []string) -> Config {
@@ -126,6 +190,12 @@ parse_args :: proc(args: []string) -> Config {
 			cfg.body_text = val
 		case "--body-html":
 			cfg.body_html = val
+		case "--attach":
+			cfg.attach_path = val
+		case "--inline":
+			cfg.inline_path = val
+		case "--cid":
+			cfg.inline_cid = val
 		case "--insecure":
 			cfg.insecure = true
 		case "--help":

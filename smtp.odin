@@ -16,9 +16,23 @@ EmailAddress :: struct {
 	email: string,
 }
 
+Attachment_Disposition :: enum {
+	Attachment,
+	Inline,
+}
+
+Attachment :: struct {
+	filename:     string,
+	content:      []byte,
+	content_type: string,
+	disposition:  Attachment_Disposition,
+	content_id:   string,
+}
+
 Send_Options :: struct {
-	body_text: string,
-	body_html: string,
+	body_text:   string,
+	body_html:   string,
+	attachments: []Attachment,
 }
 
 Client_Config :: struct {
@@ -279,7 +293,11 @@ send_mail :: proc(
 	subject: string,
 	opts: Send_Options,
 ) -> Error {
-	from_cmd := fmt.aprintf("MAIL FROM:<%s>%s", from.email, " BODY=8BITMIME" if cl._caps._8bitmime else "")
+	from_cmd := fmt.aprintf(
+		"MAIL FROM:<%s>%s",
+		from.email,
+		" BODY=8BITMIME" if cl._caps._8bitmime else "",
+	)
 	defer delete(from_cmd)
 	_write_line(cl, from_cmd) or_return
 	_expect(cl, 250) or_return
@@ -561,17 +579,180 @@ _generate_message_id :: proc(hostname: string) -> string {
 }
 
 @(private)
-_make_boundary :: proc(text, html: string) -> string {
+_make_boundary :: proc() -> string {
 	_message_id_counter += 1
-	base_ns := time.to_unix_nanoseconds(time.now())
-	candidate := fmt.aprintf("=_OdSMTP_%d_%x", base_ns, _message_id_counter)
-	for strings.contains(text, candidate) || strings.contains(html, candidate) {
-		delete(candidate)
-		_message_id_counter += 1
-		if _message_id_counter > 1_000_000 {break}
-		candidate = fmt.aprintf("=_OdSMTP_%d_%x", base_ns, _message_id_counter)
+	return fmt.aprintf("=_OdSMTP_%d_%x", time.to_unix_nanoseconds(time.now()), _message_id_counter)
+}
+
+@(private)
+_mime_type_from_ext :: proc(filename: string) -> string {
+	dot := -1
+	for i := len(filename) - 1; i >= 0; i -= 1 {
+		if filename[i] == '.' {dot = i; break}
 	}
-	return candidate
+	if dot < 0 {return "application/octet-stream"}
+
+	ext := strings.to_lower(filename[dot:])
+	defer delete(ext)
+
+	switch ext {
+	case ".pdf":
+		return "application/pdf"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".bmp":
+		return "image/bmp"
+	case ".tiff", ".tif":
+		return "image/tiff"
+	case ".zip":
+		return "application/zip"
+	case ".gz", ".gzip":
+		return "application/gzip"
+	case ".tar":
+		return "application/x-tar"
+	case ".7z":
+		return "application/x-7z-compressed"
+	case ".rar":
+		return "application/vnd.rar"
+	case ".txt":
+		return "text/plain"
+	case ".html", ".htm":
+		return "text/html"
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "application/javascript"
+	case ".json":
+		return "application/json"
+	case ".xml":
+		return "application/xml"
+	case ".csv":
+		return "text/csv"
+	case ".doc":
+		return "application/msword"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".ppt":
+		return "application/vnd.ms-powerpoint"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".mp4":
+		return "video/mp4"
+	case ".mov":
+		return "video/quicktime"
+	case ".avi":
+		return "video/x-msvideo"
+	}
+	return "application/octet-stream"
+}
+
+@(private)
+_write_attachment :: proc(cl: ^Client, att: Attachment) -> Error {
+	ct := att.content_type if att.content_type != "" else _mime_type_from_ext(att.filename)
+
+	_write_stuffed_linef(cl, "Content-Type: %s; name=\"%s\"", ct, att.filename) or_return
+	_write_stuffed_linef(
+		cl,
+		"Content-Disposition: %s; filename=\"%s\"",
+		"attachment" if att.disposition == .Attachment else "inline",
+		att.filename,
+	) or_return
+	if att.content_id != "" {
+		_write_stuffed_linef(cl, "Content-ID: <%s>", att.content_id) or_return
+	}
+	_write_stuffed_line(cl, "Content-Transfer-Encoding: base64") or_return
+	_write_stuffed_line(cl, "") or_return
+
+	encoded := _encode_body_base64(att.content)
+	defer delete(encoded)
+	_write(cl, transmute([]byte)encoded) or_return
+	return nil
+}
+
+@(private)
+_write_body_content :: proc(cl: ^Client, opts: Send_Options, inlines: []Attachment) -> Error {
+	has_text := opts.body_text != ""
+	has_html := opts.body_html != ""
+	has_inlines := len(inlines) > 0
+
+	if has_text && has_html && has_inlines {
+		alt_b := _make_boundary()
+		defer delete(alt_b)
+		rel_b := _make_boundary()
+		defer delete(rel_b)
+		_write_stuffed_linef(
+			cl,
+			"Content-Type: multipart/alternative; boundary=\"%s\"",
+			alt_b,
+		) or_return
+		_write_stuffed_line(cl, "") or_return
+		_write_stuffed_linef(cl, "--%s", alt_b) or_return
+		_write_body_part(cl, "text/plain", opts.body_text) or_return
+		_write_stuffed_linef(cl, "--%s", alt_b) or_return
+		_write_stuffed_linef(
+			cl,
+			"Content-Type: multipart/related; boundary=\"%s\"",
+			rel_b,
+		) or_return
+		_write_stuffed_line(cl, "") or_return
+		_write_stuffed_linef(cl, "--%s", rel_b) or_return
+		_write_body_part(cl, "text/html", opts.body_html) or_return
+		for &ia in inlines {
+			_write_stuffed_linef(cl, "--%s", rel_b) or_return
+			_write_attachment(cl, ia) or_return
+		}
+		_write_stuffed_linef(cl, "--%s--", rel_b) or_return
+		_write_stuffed_linef(cl, "--%s--", alt_b) or_return
+	} else if has_html && has_inlines {
+		rel_b := _make_boundary()
+		defer delete(rel_b)
+		_write_stuffed_linef(
+			cl,
+			"Content-Type: multipart/related; boundary=\"%s\"",
+			rel_b,
+		) or_return
+		_write_stuffed_line(cl, "") or_return
+		_write_stuffed_linef(cl, "--%s", rel_b) or_return
+		_write_body_part(cl, "text/html", opts.body_html) or_return
+		for &ia in inlines {
+			_write_stuffed_linef(cl, "--%s", rel_b) or_return
+			_write_attachment(cl, ia) or_return
+		}
+		_write_stuffed_linef(cl, "--%s--", rel_b) or_return
+	} else if has_text && has_html {
+		alt_b := _make_boundary()
+		defer delete(alt_b)
+		_write_stuffed_linef(
+			cl,
+			"Content-Type: multipart/alternative; boundary=\"%s\"",
+			alt_b,
+		) or_return
+		_write_stuffed_line(cl, "") or_return
+		_write_stuffed_linef(cl, "--%s", alt_b) or_return
+		_write_body_part(cl, "text/plain", opts.body_text) or_return
+		_write_stuffed_linef(cl, "--%s", alt_b) or_return
+		_write_body_part(cl, "text/html", opts.body_html) or_return
+		_write_stuffed_linef(cl, "--%s--", alt_b) or_return
+	} else if has_html {
+		_write_body_part(cl, "text/html", opts.body_html) or_return
+	} else {
+		_write_body_part(cl, "text/plain", opts.body_text) or_return
+	}
+	return nil
 }
 
 @(private)
@@ -628,8 +809,8 @@ _has_non_ascii :: proc(s: string) -> bool {
 }
 
 @(private)
-_encode_body_base64 :: proc(body: string) -> string {
-	b64 := base64.encode(transmute([]byte)body)
+_encode_body_base64 :: proc(data: []byte) -> string {
+	b64 := base64.encode(data)
 	defer delete(b64)
 
 	buf := strings.builder_make()
@@ -661,7 +842,7 @@ _write_body_part :: proc(cl: ^Client, content_type, body: string) -> Error {
 	_write_stuffed_line(cl, "") or_return
 
 	if cte == "base64" {
-		encoded := _encode_body_base64(body)
+		encoded := _encode_body_base64(transmute([]byte)body)
 		defer delete(encoded)
 		_write(cl, transmute([]byte)encoded) or_return
 	} else {
@@ -709,7 +890,9 @@ _write_message :: proc(
 	_write_header_linef(cl, "Subject: %s", encoded_subject) or_return
 
 	// Date (RFC 5322 §3.6.1 - MUST)
-	_write_header_linef(cl, "Date: %s", _format_rfc5322_date(time.now())) or_return
+	date := _format_rfc5322_date(time.now())
+	defer delete(date)
+	_write_header_linef(cl, "Date: %s", date) or_return
 
 	// Message-ID (RFC 5322 §3.6.4 - SHOULD)
 	msg_id := _generate_message_id(cl._host)
@@ -719,28 +902,34 @@ _write_message :: proc(
 	// MIME-Version
 	_write_stuffed_line(cl, "MIME-Version: 1.0") or_return
 
-	boundary := _make_boundary(opts.body_text, opts.body_html)
-	defer delete(boundary)
+	// Separate inlines from file attachments
+	inlines: [dynamic]Attachment
+	defer delete(inlines)
+	file_atts: [dynamic]Attachment
+	defer delete(file_atts)
+	for att in opts.attachments {
+		if att.disposition == .Inline {
+			append(&inlines, att)
+		} else {
+			append(&file_atts, att)
+		}
+	}
+	has_files := len(file_atts) > 0
 
-	has_text := opts.body_text != ""
-	has_html := opts.body_html != ""
-
-	if has_text && has_html {
-		_write_header_linef(
-			cl,
-			"Content-Type: multipart/alternative; boundary=\"%s\"",
-			boundary,
-		) or_return
+	if has_files {
+		mix_b := _make_boundary()
+		defer delete(mix_b)
+		_write_header_linef(cl, "Content-Type: multipart/mixed; boundary=\"%s\"", mix_b) or_return
 		_write_stuffed_line(cl, "") or_return
-		_write_stuffed_linef(cl, "--%s", boundary) or_return
-		_write_body_part(cl, "text/plain", opts.body_text) or_return
-		_write_stuffed_linef(cl, "--%s", boundary) or_return
-		_write_body_part(cl, "text/html", opts.body_html) or_return
-		_write_stuffed_linef(cl, "--%s--", boundary) or_return
-	} else if has_html {
-		_write_body_part(cl, "text/html", opts.body_html) or_return
+		_write_stuffed_linef(cl, "--%s", mix_b) or_return
+		_write_body_content(cl, opts, inlines[:]) or_return
+		for &fa in file_atts {
+			_write_stuffed_linef(cl, "--%s", mix_b) or_return
+			_write_attachment(cl, fa) or_return
+		}
+		_write_stuffed_linef(cl, "--%s--", mix_b) or_return
 	} else {
-		_write_body_part(cl, "text/plain", opts.body_text) or_return
+		_write_body_content(cl, opts, inlines[:]) or_return
 	}
 
 	return nil
